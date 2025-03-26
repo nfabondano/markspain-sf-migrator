@@ -1,0 +1,25 @@
+{
+  "name": "migrator",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.662.0",
+    "@aws-sdk/client-s3": "^3.662.0",
+    "@aws-sdk/node-http-handler": "^3.374.0",
+    "aws-sdk": "^2.1691.0",
+    "axios": "^1.7.2",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "jsforce": "^3.4.2",
+    "jsonwebtoken": "^9.0.2",
+    "node-fetch": "^2.7.0",
+    "perf_hooks": "^0.0.1"
+  }
+}
