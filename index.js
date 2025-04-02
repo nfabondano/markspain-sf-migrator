@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ override: true });
 const { S3Client, PutObjectCommand, CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand } = require('@aws-sdk/client-s3');
 const { NodeHttpHandler } = require('@aws-sdk/node-http-handler');
 const { DynamoDBClient, GetItemCommand, PutItemCommand } = require('@aws-sdk/client-dynamodb');
@@ -253,70 +253,120 @@ async function runQueryWithPagination(filters) {
   }
 }
 
+// Helper to delete the file from Salesforce
+async function deleteFileFromSalesforce(contentDocumentId) {
+  try {
+    const deleteResult = await conn.sobject('ContentDocument').delete(contentDocumentId);
 
-// Example record processing function (download and upload)
+    if (Array.isArray(deleteResult)) {
+      // If we got an array, check the first item
+      if (!deleteResult[0].success) {
+        throw new Error(
+          `Salesforce delete failed: ${deleteResult[0].errors.join(', ')}`
+        );
+      }
+    } else if (!deleteResult.success) {
+      throw new Error(`Salesforce delete failed: ${deleteResult.errors.join(', ')}`);
+    }
+
+    console.log(`File [ContentDocumentId=${contentDocumentId}] successfully deleted from Salesforce.`);
+    return true;
+  } catch (err) {
+    console.error(`Error deleting Salesforce ContentDocumentId=${contentDocumentId}:`, err);
+    // We re-throw so we can handle it in processRecord
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Example record processing function (download, upload, log, delete from SF)
 async function processRecord(record) {
   const id = record.ContentDocumentId;
   const title = record.ContentDocument.Title.replace(/\s+/g, '_'); // Reemplaza espacios en el título por guiones bajos
   const fileExtension = record.ContentDocument.FileType;
   const fileName = `${S3_FOLDER}/${id}/${title}`;
   const createdDate = record.ContentDocument.CreatedDate;
-  const fileId = id;
+  const fileId = id; // same as record.ContentDocumentId
   const versionDataUrl = record.ContentDocument.LatestPublishedVersion.VersionData;
 
-  console.log("------------------------------------------------------")
-  // Verifica si el archivo ya existe en DynamoDB
+  console.log("------------------------------------------------------");
+  console.log(`Handling record -> File ID: ${id} | Created Date: ${createdDate} | File: ${fileName}`);
+
+  // Check if file already exists in Dynamo
   const fileExists = await fileExistsInDynamoDB(fileId);
   if (fileExists) {
     console.log(`File ${fileName}.${fileExtension} already exists. Skipping upload.`);
     return;
   }
 
-  // Descarga el archivo
+  // Download the file
   console.log(`Downloading file ID: ${id} - ${createdDate} - ${fileName}`);
   const buffer = await downloadFile(versionDataUrl);
 
-  // Si la descarga falló (buffer es null), salta al siguiente registro y registra el error
+  // If download failed (buffer is null), skip to the next recored and register the error
   if (!buffer) {
-    logErrorToFile(`Failed to download file ${fileName} with URL: ${versionDataUrl}`);
+    logErrorToFile(`Failed to download file [${fileName}] from URL: ${versionDataUrl}`);
     console.log(`Skipping file ${fileName} due to download failure.`);
     throw new Error(`Failed to download: ${fileName}`);
   }
 
-  // Carga el archivo en S3
+  // Upload to S3
   try {
     if (buffer.length > MULTIPART_THRESHOLD) {
-      console.log(`File ${fileName} is larger than 5MB, using Multipart Upload...`);
+      console.log(`File ${fileName} is larger than threshold, using Multipart Upload...`);
       await uploadLargeFileToS3(fileName, buffer);
     } else {
       console.log(`Uploading file ${fileName} to S3...`);
       const s3Params = {
         Bucket: S3_BUCKET,
-        Key: fileName, // Usa la ruta con Opportunity/id para simular la estructura de carpetas
+        Key: fileName,
         Body: buffer,
-        ContentType: 'application/octet-stream',
+        ContentType: 'application/octet-stream'
       };
       await s3.send(new PutObjectCommand(s3Params));
       console.log(`File ${fileName} successfully uploaded to S3.`);
     }
 
-    // Registra el éxito en DynamoDB
+    // If we reach here, the upload was successful – log success in Dynamo
     const dynamoParams = {
       TableName: DYNAMO_TABLE,
       Item: {
         fileId: { S: fileId },
         fileName: { S: fileName },
         migratedAt: { S: new Date().toISOString() },
-        status: { S: 'SUCCESS' },
-      },
+        status: { S: 'SUCCESS' }
+      }
     };
     await dynamoDB.send(new PutItemCommand(dynamoParams));
     console.log(`Migration of file ${fileName} logged in DynamoDB.`);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Delete from Salesforce now that we know it's safe
+    try {
+      await deleteFileFromSalesforce(id);
+    } catch (deleteError) {
+      // If Salesforce delete fails, log to Dynamo so we know it wasn’t removed
+      console.error(`Could not delete file ${fileName} from SF:`, deleteError);
+      logErrorToFile(`Could not delete file [${fileName}] in SF: ${deleteError.message}`);
+
+      const dynamoDeleteErrorParams = {
+        TableName: DYNAMO_TABLE,
+        Item: {
+          fileId: { S: fileId },
+          fileName: { S: fileName },
+          migratedAt: { S: new Date().toISOString() },
+          status: { S: 'DELETE_FAILED' },
+          errorMessage: { S: deleteError.message }
+        }
+      };
+      await dynamoDB.send(new PutItemCommand(dynamoDeleteErrorParams));
+    }
+    // ─────────────────────────────────────────────────────────────────────────
   } catch (uploadError) {
     console.error(`Error uploading ${fileName} to S3:`, uploadError);
     logErrorToFile(`Error uploading file ${fileName} to S3: ${uploadError.message}`);
 
-    // Registra el error en DynamoDB
+    // Log the failure in DynamoDB
     const dynamoErrorParams = {
       TableName: DYNAMO_TABLE,
       Item: {
@@ -324,15 +374,13 @@ async function processRecord(record) {
         fileName: { S: fileName },
         migratedAt: { S: new Date().toISOString() },
         status: { S: 'FAILED' },
-        errorMessage: { S: uploadError.message },
-      },
+        errorMessage: { S: uploadError.message }
+      }
     };
     await dynamoDB.send(new PutItemCommand(dynamoErrorParams));
     console.log(`Error for file ${fileName} logged in DynamoDB.`);
   }
 }
-
-
 
 // Function to start migration with filters
 async function migrateDataWithFilters(filters) {
@@ -376,18 +424,18 @@ async function migrateDataByDay(startDate, endDate) {
   while (currentDate <= finalDate) {
     // Define el rango de fecha para el día actual
     const nextDate = addDays(currentDate, 1);
-    const filterDate = {
+    const fitersDates = {
       startDate: formatDateToISOString(currentDate),  // Día actual
       endDate: formatDateToISOString(nextDate),       // Día siguiente
     };
 
-    console.log(`Running migration for date: ${filterDate.startDate} to ${filterDate.endDate}`);
+    console.log(`Running migration for date: ${fitersDates.startDate} to ${fitersDates.endDate}`);
 
     try {
       // Ejecuta la migración para el día actual
-      await migrateDataWithFilters(filterDate);
+      await migrateDataWithFilters(fitersDates);
     } catch (error) {
-      console.error(`Error during migration for ${filterDate.startDate}:`, error);
+      console.error(`Error during migration for ${fitersDates.startDate}:`, error);
     }
 
     // Incrementa la fecha actual al siguiente día
