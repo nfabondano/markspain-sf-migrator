@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ override: true });
 const { S3Client, PutObjectCommand, CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand } = require('@aws-sdk/client-s3');
 const { NodeHttpHandler } = require('@aws-sdk/node-http-handler');
 const { DynamoDBClient, GetItemCommand, PutItemCommand } = require('@aws-sdk/client-dynamodb');
@@ -312,11 +312,50 @@ async function processRecord(record) {
     };
     await dynamoDB.send(new PutItemCommand(dynamoParams));
     console.log(`Migration of file ${fileName} logged in DynamoDB.`);
+
+    // Query ContentVersion and set S3_Migration__c = true
+    try {
+      const contentVersionResult = await conn.query(`
+        SELECT Id, PathOnClient, FileType, ContentDocumentId, S3_Migration__c
+        FROM ContentVersion
+        WHERE ContentDocumentId = '${id}'
+      `);
+
+      // If the record(s) exist, update each to mark S3 migration as complete
+      if (contentVersionResult && contentVersionResult.totalSize > 0) {
+        for (const versionRec of contentVersionResult.records) {
+          await conn.sobject('ContentVersion').update({
+            Id: versionRec.Id,
+            S3_Migration__c: true
+          });
+          console.log(`Set S3_Migration__c = true on ContentVersion ${versionRec.Id}`);
+        }
+      } else {
+        console.log('No matching ContentVersion found to update.');
+      }
+    } catch (sfError) {
+      //If updating S3_Migration__c fails, log to DynamoDB
+      console.error(`Error updating S3_Migration__c for file ${fileName} in Salesforce:`, sfError);
+
+      const dynamoErrorParams = {
+        TableName: DYNAMO_TABLE,
+        Item: {
+          fileId: { S: fileId },
+          fileName: { S: fileName },
+          migratedAt: { S: new Date().toISOString() },
+          status: { S: 'SF_UPDATE_FAILED' },
+          errorMessage: { S: sfError.message },
+        },
+      };
+      await dynamoDB.send(new PutItemCommand(dynamoErrorParams));
+      console.log(`Salesforce update failure for file ${fileName} logged in DynamoDB.`);
+    }
+
   } catch (uploadError) {
+    // Handle errors from the upload step
     console.error(`Error uploading ${fileName} to S3:`, uploadError);
     logErrorToFile(`Error uploading file ${fileName} to S3: ${uploadError.message}`);
 
-    // Registra el error en DynamoDB
     const dynamoErrorParams = {
       TableName: DYNAMO_TABLE,
       Item: {
@@ -331,7 +370,6 @@ async function processRecord(record) {
     console.log(`Error for file ${fileName} logged in DynamoDB.`);
   }
 }
-
 
 
 // Function to start migration with filters
