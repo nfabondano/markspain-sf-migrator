@@ -375,10 +375,6 @@ async function processRecord(record) {
 // Function to start migration with filters
 async function migrateDataWithFilters(filters) {
   try {
-    // Log in to Salesforce
-    await conn.login(SF_USERNAME, SF_PASSWORD);
-    console.log('Successfully connected to Salesforce.');
-
     // Run query with pagination and filters
     await runQueryWithPagination(filters);
 
@@ -435,7 +431,23 @@ async function migrateDataByDay(startDate, endDate) {
   console.log('All migrations completed.');
 }
 
+(async () => {
+  // 1) do ONE login, then exit on failure
+  try {
+    await conn.login(SF_USERNAME, SF_PASSWORD);
+    console.log('✔ Salesforce login successful!');
+  } catch (err) {
+    console.error('❌ Salesforce login failed:', err.message);
+    process.exit(1);
+  }
 
-// Execute the migration with filters
-//migrateDataWithFilters(filters);
-migrateDataByDay(filterDate.startDate, filterDate.endDate);
+  // 2) if login worked, run your day‐by‐day migration
+  try {
+    await migrateDataByDay(filterDate.startDate, filterDate.endDate);
+    console.log('✔ All migrations completed.');
+    process.exit(0);
+  } catch (err) {
+    console.error('❌ Unexpected error during migration:', err);
+    process.exit(1);
+  }
+})();
