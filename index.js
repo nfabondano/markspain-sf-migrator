@@ -1,6 +1,12 @@
 require('dotenv').config({ override: true });
-const { S3Client, PutObjectCommand, CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand } = require('@aws-sdk/client-s3');
-const { NodeHttpHandler } = require('@aws-sdk/node-http-handler');
+const {
+  S3Client,
+  PutObjectCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  ListObjectsV2Command        // ← Added
+} = require('@aws-sdk/client-s3'); const { NodeHttpHandler } = require('@aws-sdk/node-http-handler');
 const { DynamoDBClient, GetItemCommand, PutItemCommand } = require('@aws-sdk/client-dynamodb');
 const jsforce = require('jsforce');
 const fetch = require('node-fetch');
@@ -13,11 +19,9 @@ const filterDate = {
   endDate: process.env.END_DATE//'2024-10-22T23:59:59Z'
 };
 
-
 // Constants for configurations
 const S3_BUCKET = process.env.S3_BUCKET;
 const S3_FOLDER = process.env.S3_FOLDER;
-const BATCH_SIZE = parseInt(process.env.BATCH_SIZE, 10);  // Batch size for pagination
 const DYNAMO_TABLE = process.env.DYNAMO_TABLE;
 const MULTIPART_THRESHOLD = parseInt(process.env.MULTIPART_THRESHOLD, 10);  // Multipart Upload limit in bytes
 
@@ -46,17 +50,16 @@ const conn = new jsforce.Connection({
 });
 
 // Function to check if the file already exists in DynamoDB
-async function fileExistsInDynamoDB(fileId) {
+async function fileExistsInDynamoDB(fileName) {
   const params = {
     TableName: DYNAMO_TABLE,
     Key: {
-      fileId: { S: fileId }
+      fileName: { S: fileName }
     }
   };
-
   try {
     const result = await dynamoDB.send(new GetItemCommand(params));
-    return !!result.Item;  // If result.Item is truthy, the file exists
+    return !!result.Item;
   } catch (err) {
     console.error('Error checking DynamoDB for file:', err);
     throw err;
@@ -193,11 +196,10 @@ async function downloadFile(versionDataUrl) {
 
 
 function buildQuery(filters) {
-
   console.log("FILTERS")
   console.log(filters)
 
-  let baseQuery = `SELECT Id, ContentDocument.CreatedDate ,ContentDocument.Title, ContentDocumentId, ContentDocument.FileType, ContentDocument.LatestPublishedVersion.VersionData 
+  let baseQuery = `SELECT LinkedEntityId, Id, ContentDocument.CreatedDate ,ContentDocument.Title, ContentDocumentId, ContentDocument.FileType, ContentDocument.LatestPublishedVersion.FileExtension, ContentDocument.LatestPublishedVersion.VersionData 
   FROM ContentDocumentLink 
   WHERE LinkedEntityId IN (SELECT Id FROM ${S3_FOLDER}) 
   AND ContentDocument.FileType != 'SNOTE'`;
@@ -211,69 +213,33 @@ function buildQuery(filters) {
     baseQuery += ` AND ContentDocument.CreatedDate <= ${filters.endDate}`;
   }
 
-  console.log("base query",baseQuery)
+  console.log("base query", baseQuery)
 
   return baseQuery;
 }
 
-
-// Function to run the SOQL query and handle pagination using queryMore
-async function runQueryWithPagination(filters) {
-  try {
-    const query = buildQuery(filters);  // Build the query
-    let result = await conn.query(query);  // Initial query call
-
-    // Check if records are found
-    if (result.records.length > 0) {
-      console.log(`Found ${result.totalSize} records.`);
-
-      // Loop to process records and paginate if necessary
-      while (true) {
-        console.log(`Processing ${result.records.length} records...`);
-
-        // Process the current batch of records
-        for (const record of result.records) {
-          await processRecord(record);  // Your logic to process each record
-        }
-
-        // If there are more records to fetch, use queryMore
-        if (!result.done) {
-          console.log(`Fetching more records...`);
-          result = await conn.queryMore(result.nextRecordsUrl);  // Fetch more records using pagination
-        } else {
-          console.log('All records processed successfully.');
-          break;
-        }
-      }
-    } else {
-      console.log('No records found.');
-    }
-  } catch (err) {
-    console.error('Error running query with pagination:', err);
-  }
-}
-
-
 // Example record processing function (download and upload)
 async function processRecord(record) {
-  const id = record.ContentDocumentId;
+  let answer = false;
+
+  const fileId = record.ContentDocumentId;
+  const parentId = record.LinkedEntityId
   const title = record.ContentDocument.Title.replace(/\s+/g, '_'); // Reemplaza espacios en el título por guiones bajos
-  const fileExtension = record.ContentDocument.FileType;
-  const fileName = `${S3_FOLDER}/${id}/${title}`;
+  const fileExtension = record.ContentDocument.LatestPublishedVersion.FileExtension.toLowerCase();
+  const fileName = `${S3_FOLDER}/${parentId}/${title}.${fileExtension}`;
   const createdDate = record.ContentDocument.CreatedDate;
-  const fileId = id;
   const versionDataUrl = record.ContentDocument.LatestPublishedVersion.VersionData;
 
   console.log("------------------------------------------------------")
   // Verifica si el archivo ya existe en DynamoDB
-  const fileExists = await fileExistsInDynamoDB(fileId);
+  const fileExists = await fileExistsInDynamoDB(fileName);
   if (fileExists) {
-    console.log(`File ${fileName}.${fileExtension} already exists. Skipping upload.`);
-    return;
+    console.log(`File ${fileName} already exists. Skipping upload.`);
+    return answer;
   }
 
   // Descarga el archivo
-  console.log(`Downloading file ID: ${id} - ${createdDate} - ${fileName}`);
+  console.log(`Downloading file ID: ${fileId} - ${createdDate} - ${fileName}`);
   const buffer = await downloadFile(versionDataUrl);
 
   // Si la descarga falló (buffer es null), salta al siguiente registro y registra el error
@@ -312,13 +278,14 @@ async function processRecord(record) {
     };
     await dynamoDB.send(new PutItemCommand(dynamoParams));
     console.log(`Migration of file ${fileName} logged in DynamoDB.`);
+    answer = true;
 
     // Query ContentVersion and set S3_Migration__c = true
     try {
       const contentVersionResult = await conn.query(`
         SELECT Id, PathOnClient, FileType, ContentDocumentId, S3_Migration__c
         FROM ContentVersion
-        WHERE ContentDocumentId = '${id}'
+        WHERE ContentDocumentId = '${fileId}'
       `);
 
       // If the record(s) exist, update each to mark S3 migration as complete
@@ -340,8 +307,8 @@ async function processRecord(record) {
       const dynamoErrorParams = {
         TableName: DYNAMO_TABLE,
         Item: {
-          fileId: { S: fileId },
           fileName: { S: fileName },
+          fileId: { S: fileId },
           migratedAt: { S: new Date().toISOString() },
           status: { S: 'SF_UPDATE_FAILED' },
           errorMessage: { S: sfError.message },
@@ -350,7 +317,6 @@ async function processRecord(record) {
       await dynamoDB.send(new PutItemCommand(dynamoErrorParams));
       console.log(`Salesforce update failure for file ${fileName} logged in DynamoDB.`);
     }
-
   } catch (uploadError) {
     // Handle errors from the upload step
     console.error(`Error uploading ${fileName} to S3:`, uploadError);
@@ -359,8 +325,8 @@ async function processRecord(record) {
     const dynamoErrorParams = {
       TableName: DYNAMO_TABLE,
       Item: {
-        fileId: { S: fileId },
         fileName: { S: fileName },
+        fileId: { S: fileId },
         migratedAt: { S: new Date().toISOString() },
         status: { S: 'FAILED' },
         errorMessage: { S: uploadError.message },
@@ -368,71 +334,48 @@ async function processRecord(record) {
     };
     await dynamoDB.send(new PutItemCommand(dynamoErrorParams));
     console.log(`Error for file ${fileName} logged in DynamoDB.`);
+  } finally {
+    return answer;
   }
 }
 
-
-// Function to start migration with filters
-async function migrateDataWithFilters(filters) {
-  try {
-    // Run query with pagination and filters
-    await runQueryWithPagination(filters);
-
-    console.log('Migration process completed.');
-  } catch (err) {
-    console.error('Error in migration process:', err);
+// ────────────────────────────────────────────────────────────────────────────────
+// fetch all Salesforce records in one paginated call
+async function fetchAllRecords(filters) {
+  const all = [];
+  let result = await conn.query(buildQuery(filters));
+  all.push(...result.records);
+  while (!result.done) {
+    result = await conn.queryMore(result.nextRecordsUrl);
+    all.push(...result.records);
   }
+  console.log(`Fetched ${all.length} Salesforce records.`);
+  return all;
 }
 
-// Example: Add filters to the query
-const filters = [
-  { field: 'ContentDocument.FileType', operator: '=', value: 'bin' },               // Filtrar por tipo de archivo
-  { field: 'LinkedEntityId', operator: 'IN', value: '(SELECT Id FROM Opportunity)' } // Filtrar por ID de Opportunity
-];
-
-// Función para añadir un día a una fecha
-function addDays(date, days) {
-  const result = new Date(date);
-  result.setDate(result.getDate() + days);
-  return result;
-}
-
-// Función para formatear la fecha en el formato 'YYYY-MM-DDTHH:mm:ssZ'
-function formatDateToISOString(date) {
-  return date.toISOString().split('T')[0] + 'T00:00:00Z';
-}
-
-async function migrateDataByDay(startDate, endDate) {
-  let currentDate = new Date(startDate);
-  const finalDate = new Date(endDate);
-
-  // Itera desde la fecha inicial hasta la fecha final
-  while (currentDate <= finalDate) {
-    // Define el rango de fecha para el día actual
-    const nextDate = addDays(currentDate, 1);
-    const filterDate = {
-      startDate: formatDateToISOString(currentDate),  // Día actual
-      endDate: formatDateToISOString(nextDate),       // Día siguiente
-    };
-
-    console.log(`Running migration for date: ${filterDate.startDate} to ${filterDate.endDate}`);
-
-    try {
-      // Ejecuta la migración para el día actual
-      await migrateDataWithFilters(filterDate);
-    } catch (error) {
-      console.error(`Error during migration for ${filterDate.startDate}:`, error);
+// list every S3 key under our folder prefix
+async function listS3Keys() {
+  const keys = [];
+  let ContinuationToken;
+  const prefix = S3_FOLDER.replace(/\/$/, '') + '/';
+  do {
+    const resp = await s3.send(new ListObjectsV2Command({
+      Bucket: S3_BUCKET,
+      Prefix: prefix,
+      ContinuationToken
+    }));
+    if (resp.Contents) {
+      for (const obj of resp.Contents) keys.push(obj.Key);
     }
-
-    // Incrementa la fecha actual al siguiente día
-    currentDate = nextDate;
-  }
-
-  console.log('All migrations completed.');
+    ContinuationToken = resp.IsTruncated ? resp.NextContinuationToken : null;
+  } while (ContinuationToken);
+  console.log(`Found ${keys.length} existing S3 objects.`);
+  return new Set(keys);
 }
 
+// ────────────────────────────────────────────────────────────────────────────────
+// REPLACED main day‐by‐day driver with a single‐shot + pause + migrate‐missing
 (async () => {
-  // 1) do ONE login, then exit on failure
   try {
     await conn.login(SF_USERNAME, SF_PASSWORD);
     console.log('✔ Salesforce login successful!');
@@ -441,11 +384,33 @@ async function migrateDataByDay(startDate, endDate) {
     process.exit(1);
   }
 
-  // 2) if login worked, run your day‐by‐day migration
+  // 1) fetch everything, 2) fetch S3, 3) diff, 4) pause, 5) process only missing
   try {
-    await migrateDataByDay(filterDate.startDate, filterDate.endDate);
-    console.log('✔ All migrations completed.');
+    const sfRecords = await fetchAllRecords(filterDate);
+    const s3Keys = await listS3Keys();
+    const missing = sfRecords.filter(rec => {
+      const parentId = rec.LinkedEntityId;
+      const title = rec.ContentDocument.Title.replace(/\s+/g, '_');
+      const extension = rec.ContentDocument.LatestPublishedVersion.FileExtension.toLowerCase();
+      const key = `${S3_FOLDER}/${parentId}/${title}.${extension}`;
+      return !s3Keys.has(key);
+    });
+
+    console.log(`\n🚨  Found ${missing.length} missing items between ${filterDate.startDate} and ${filterDate.endDate}.\n` +
+      `Press any key to start migrating those…`);
+    process.stdin.setRawMode(true);
+    await new Promise(res => process.stdin.once('data', res));
+    process.stdin.setRawMode(false);
+
+    console.log('\nStarting migration of missing items…');
+    let migratedCount = 0;
+    for (const rec of missing) {
+      const ok = await processRecord(rec);
+      if (ok) migratedCount++;
+    }
+    console.log(`✔ ${migratedCount} files migrated.`);
     process.exit(0);
+
   } catch (err) {
     console.error('❌ Unexpected error during migration:', err);
     process.exit(1);
