@@ -21,7 +21,7 @@ const filterDate = {
 
 // Constants for configurations
 const S3_BUCKET = process.env.S3_BUCKET;
-const S3_FOLDER = process.env.S3_FOLDER;
+const S3_FOLDERS = process.env.S3_FOLDER.split(',');
 const DYNAMO_TABLE = process.env.DYNAMO_TABLE;
 const MULTIPART_THRESHOLD = parseInt(process.env.MULTIPART_THRESHOLD, 10);  // Multipart Upload limit in bytes
 
@@ -195,13 +195,13 @@ async function downloadFile(versionDataUrl) {
 }
 
 
-function buildQuery(filters) {
+function buildQuery(filters, folder) {
   console.log("FILTERS")
   console.log(filters)
 
-  let baseQuery = `SELECT LinkedEntityId, Id, ContentDocument.CreatedDate ,ContentDocument.Title, ContentDocumentId, ContentDocument.FileType, ContentDocument.LatestPublishedVersion.FileExtension, ContentDocument.LatestPublishedVersion.VersionData 
+  let baseQuery = `SELECT Id, LinkedEntityId, ContentDocumentId, ContentDocument.CreatedDate, ContentDocument.LatestPublishedVersion.PathOnClient, ContentDocument.LatestPublishedVersion.VersionData 
   FROM ContentDocumentLink 
-  WHERE LinkedEntityId IN (SELECT Id FROM ${S3_FOLDER}) 
+  WHERE LinkedEntityId IN (SELECT Id FROM ${folder}) 
   AND ContentDocument.FileType != 'SNOTE'`;
 
   // Agrega filtros de fecha si están presentes
@@ -219,14 +219,15 @@ function buildQuery(filters) {
 }
 
 // Example record processing function (download and upload)
-async function processRecord(record) {
+async function processRecord(record, folder) {
   let answer = false;
 
   const fileId = record.ContentDocumentId;
-  const parentId = record.LinkedEntityId
-  const title = record.ContentDocument.Title.replace(/\s+/g, '_'); // Reemplaza espacios en el título por guiones bajos
-  const fileExtension = record.ContentDocument.LatestPublishedVersion.FileExtension.toLowerCase();
-  const fileName = `${S3_FOLDER}/${parentId}/${title}.${fileExtension}`;
+  const parentId = record.LinkedEntityId;
+  const pathOnClient = record.ContentDocument.LatestPublishedVersion.PathOnClient;
+  const baseName = path.basename(pathOnClient).replace(/\s+/g, '_');
+  const folderName = `${folder}/${parentId}/${fileId}_${baseName}`;
+  const fileName = `${folderName}/${baseName}`;
   const createdDate = record.ContentDocument.CreatedDate;
   const versionDataUrl = record.ContentDocument.LatestPublishedVersion.VersionData;
 
@@ -341,9 +342,9 @@ async function processRecord(record) {
 
 // ────────────────────────────────────────────────────────────────────────────────
 // fetch all Salesforce records in one paginated call
-async function fetchAllRecords(filters) {
+async function fetchAllRecords(filters, folder) {
   const all = [];
-  let result = await conn.query(buildQuery(filters));
+  let result = await conn.query(buildQuery(filters,folder));
   all.push(...result.records);
   while (!result.done) {
     result = await conn.queryMore(result.nextRecordsUrl);
@@ -354,10 +355,10 @@ async function fetchAllRecords(filters) {
 }
 
 // list every S3 key under our folder prefix
-async function listS3Keys() {
+async function listS3Keys(folder) {
   const keys = [];
   let ContinuationToken;
-  const prefix = S3_FOLDER.replace(/\/$/, '') + '/';
+  const prefix = folder.replace(/\/$/, '') + '/';
   do {
     const resp = await s3.send(new ListObjectsV2Command({
       Bucket: S3_BUCKET,
@@ -386,29 +387,35 @@ async function listS3Keys() {
 
   // 1) fetch everything, 2) fetch S3, 3) diff, 4) pause, 5) process only missing
   try {
-    const sfRecords = await fetchAllRecords(filterDate);
-    const s3Keys = await listS3Keys();
-    const missing = sfRecords.filter(rec => {
-      const parentId = rec.LinkedEntityId;
-      const title = rec.ContentDocument.Title.replace(/\s+/g, '_');
-      const extension = rec.ContentDocument.LatestPublishedVersion.FileExtension.toLowerCase();
-      const key = `${S3_FOLDER}/${parentId}/${title}.${extension}`;
-      return !s3Keys.has(key);
-    });
+    for (const folder of S3_FOLDERS) {
+      const sfRecords = await fetchAllRecords(filterDate, folder);
+      const s3Keys = await listS3Keys(folder);
+      const missing = sfRecords.filter(rec => {
+        const parentId = rec.LinkedEntityId;
+        const pathOnClient = rec.ContentDocument.LatestPublishedVersion.PathOnClient;
+        const baseName = path.basename(pathOnClient).replace(/\s+/g, '_');
+        const key = `${folder}/${parentId}/${rec.ContentDocumentId}_${baseName}/${baseName}`;
+        return !s3Keys.has(key);
+      });
 
-    console.log(`\n🚨  Found ${missing.length} missing items between ${filterDate.startDate} and ${filterDate.endDate}.\n` +
-      `Press any key to start migrating those…`);
-    process.stdin.setRawMode(true);
-    await new Promise(res => process.stdin.once('data', res));
-    process.stdin.setRawMode(false);
+      console.log(`\n🚨  Found ${missing.length} missing items between ${filterDate.startDate} and ${filterDate.endDate}.\n`);
+      console.log('\nStarting migration of missing items…');
 
-    console.log('\nStarting migration of missing items…');
-    let migratedCount = 0;
-    for (const rec of missing) {
-      const ok = await processRecord(rec);
-      if (ok) migratedCount++;
+      let migratedCount = 0;
+      for (const rec of missing) {
+        const ok = await processRecord(rec, folder);
+        if (ok) migratedCount++;
+      }
+      console.log(`✔ ${migratedCount} files migrated.`);
+
+      fs.appendFileSync(
+        path.join(__dirname, 'migration_summary.txt'),
+        `${folder}: ${migratedCount}\n`,
+        'utf8'
+      );
+      console.log(`📄 ${folder} → ${migratedCount} files migrated.`);
+
     }
-    console.log(`✔ ${migratedCount} files migrated.`);
     process.exit(0);
 
   } catch (err) {
