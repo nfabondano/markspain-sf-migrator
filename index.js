@@ -7,7 +7,7 @@ const {
   CompleteMultipartUploadCommand,
   ListObjectsV2Command        // ← Added
 } = require('@aws-sdk/client-s3'); const { NodeHttpHandler } = require('@aws-sdk/node-http-handler');
-const { DynamoDBClient, GetItemCommand, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBClient, GetItemCommand, PutItemCommand, ScanCommand } = require('@aws-sdk/client-dynamodb');
 const jsforce = require('jsforce');
 const fetch = require('node-fetch');
 const fs = require('fs');
@@ -232,12 +232,7 @@ async function processRecord(record, folder) {
   const versionDataUrl = record.ContentDocument.LatestPublishedVersion.VersionData;
 
   console.log("------------------------------------------------------")
-  // Verifica si el archivo ya existe en DynamoDB
-  const fileExists = await fileExistsInDynamoDB(fileName);
-  if (fileExists) {
-    console.log(`File ${fileName} already exists. Skipping upload.`);
-    return answer;
-  }
+  // DynamoDB already checked up-front; no need to re-check here
 
   // Descarga el archivo
   console.log(`Downloading file ID: ${fileId} - ${createdDate} - ${fileName}`);
@@ -354,25 +349,28 @@ async function fetchAllRecords(filters, folder) {
   return all;
 }
 
-// list every S3 key under our folder prefix
-async function listS3Keys(folder) {
-  const keys = [];
-  let ContinuationToken;
-  const prefix = folder.replace(/\/$/, '') + '/';
-  do {
-    const resp = await s3.send(new ListObjectsV2Command({
-      Bucket: S3_BUCKET,
-      Prefix: prefix,
-      ContinuationToken
-    }));
-    if (resp.Contents) {
-      for (const obj of resp.Contents) keys.push(obj.Key);
-    }
-    ContinuationToken = resp.IsTruncated ? resp.NextContinuationToken : null;
-  } while (ContinuationToken);
-  console.log(`Found ${keys.length} existing S3 objects.`);
-  return new Set(keys);
-}
+// list already-migrated keys from DynamoDB instead of S3
+async function listDynamoKeys(folder) {
+    const keys = new Set();
+    let ExclusiveStartKey;
+    const prefix = folder.replace(/\/$/, '') + '/';
+    do {
+      const resp = await dynamoDB.send(new ScanCommand({
+        TableName: DYNAMO_TABLE,
+        ProjectionExpression: 'fileName',
+        ExclusiveStartKey
+      }));
+     if (resp.Items) {
+        for (const i of resp.Items) {
+          const name = i.fileName?.S;
+          if (name?.startsWith(prefix)) keys.add(name);
+        }
+      }
+      ExclusiveStartKey = resp.LastEvaluatedKey;
+    } while (ExclusiveStartKey);
+    console.log(`Found ${keys.size} existing DynamoDB records.`);
+    return keys;
+  }
 
 // ────────────────────────────────────────────────────────────────────────────────
 // REPLACED main day‐by‐day driver with a single‐shot + pause + migrate‐missing
@@ -389,13 +387,13 @@ async function listS3Keys(folder) {
   try {
     for (const folder of S3_FOLDERS) {
       const sfRecords = await fetchAllRecords(filterDate, folder);
-      const s3Keys = await listS3Keys(folder);
+      const migratedKeys = await listDynamoKeys(folder);
       const missing = sfRecords.filter(rec => {
         const parentId = rec.LinkedEntityId;
         const pathOnClient = rec.ContentDocument.LatestPublishedVersion.PathOnClient;
         const baseName = path.basename(pathOnClient).replace(/\s+/g, '_');
         const key = `${folder}/${parentId}/${rec.ContentDocumentId}_${baseName}/${baseName}`;
-        return !s3Keys.has(key);
+        return !migratedKeys.has(key);
       });
 
       console.log(`\n🚨  Found ${missing.length} missing items between ${filterDate.startDate} and ${filterDate.endDate}.\n`);
@@ -406,13 +404,6 @@ async function listS3Keys(folder) {
         const ok = await processRecord(rec, folder);
         if (ok) migratedCount++;
       }
-      console.log(`✔ ${migratedCount} files migrated.`);
-
-      fs.appendFileSync(
-        path.join(__dirname, 'migration_summary.txt'),
-        `${folder}: ${migratedCount}\n`,
-        'utf8'
-      );
       console.log(`📄 ${folder} → ${migratedCount} files migrated.`);
 
     }
