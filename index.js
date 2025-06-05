@@ -7,7 +7,7 @@ const {
   CompleteMultipartUploadCommand,
   HeadObjectCommand
 } = require('@aws-sdk/client-s3'); const { NodeHttpHandler } = require('@aws-sdk/node-http-handler');
-const { DynamoDBClient, GetItemCommand, PutItemCommand, ScanCommand } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBClient, PutItemCommand, ScanCommand } = require('@aws-sdk/client-dynamodb');
 const jsforce = require('jsforce');
 const fetch = require('node-fetch');
 const fs = require('fs');
@@ -182,7 +182,7 @@ function buildQuery(filters, folder) {
   console.log("FILTERS")
   console.log(filters)
 
-  let baseQuery = `SELECT Id, LinkedEntityId, ContentDocumentId, ContentDocument.CreatedDate, ContentDocument.LatestPublishedVersion.PathOnClient, ContentDocument.LatestPublishedVersion.VersionData 
+  let baseQuery = `SELECT Id, LinkedEntityId, ContentDocumentId, ContentDocument.CreatedDate, ContentDocument.LatestPublishedVersionId, ContentDocument.LatestPublishedVersion.PathOnClient, ContentDocument.LatestPublishedVersion.VersionData 
   FROM ContentDocumentLink 
   WHERE LinkedEntityId IN (SELECT Id FROM ${folder}) 
   AND ContentDocument.FileType != 'SNOTE'`;
@@ -285,7 +285,7 @@ async function processRecord(record, folder) {
       if (contentVersionResult && contentVersionResult.totalSize > 0) {
         for (const versionRec of contentVersionResult.records) {
           await conn.sobject('ContentVersion').update({
-            Id: versionRec.Id,
+            Id: record.ContentDocument.LatestPublishedVersionId,
             S3_Migration__c: true
           });
           console.log(`Set S3_Migration__c = true on ContentVersion ${versionRec.Id}`);

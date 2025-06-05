@@ -11,6 +11,13 @@ const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
 const BUCKET = process.env.S3_BUCKET;
 const FOLDERS = process.env.S3_FOLDER.split(',');
 
+const SKIP_SUBFOLDERS = ['go media files', 'video partitions'];   // all lower-case
+
+const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;                              
+function isRecent(lastModifiedDate) {                                        
+  return Date.now() - lastModifiedDate.getTime() <= TEN_DAYS_MS;            
+}                                                                             
+
 async function objectExists(key) {
     try {
       await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
@@ -37,6 +44,12 @@ async function processParent(folder) {
     }));
 
     for (const obj of listResp.Contents || []) {
+
+if (!isRecent(obj.LastModified)) {                                     // ← NEW
+        console.log(`Skipped ${obj.Key}: older than 5 days`);                // ← NEW
+        continue;                                                            // ← NEW
+      }                                                                      
+
       const parts = obj.Key.split('/');
       // skip top-level and direct files
       if (parts.length !== 4) continue;
@@ -45,6 +58,11 @@ async function processParent(folder) {
       const subfolder = parts[2];                     // e.g. id_baseName
       const fileName = parts[3];                      // actual file
       const destKey = `${parentPath}/${fileName}`;
+
+ if (SKIP_SUBFOLDERS.includes(subfolder.trim().toLowerCase())) {
+    console.log(`Skipped ${obj.Key}: inside “${subfolder}”`);
+    continue;
+  }
 
       if (!await objectExists(destKey)) {
         // move: copy then delete
