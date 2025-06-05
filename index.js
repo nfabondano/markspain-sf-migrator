@@ -5,7 +5,7 @@ const {
   CreateMultipartUploadCommand,
   UploadPartCommand,
   CompleteMultipartUploadCommand,
-  ListObjectsV2Command        // ← Added
+  HeadObjectCommand
 } = require('@aws-sdk/client-s3'); const { NodeHttpHandler } = require('@aws-sdk/node-http-handler');
 const { DynamoDBClient, GetItemCommand, PutItemCommand, ScanCommand } = require('@aws-sdk/client-dynamodb');
 const jsforce = require('jsforce');
@@ -23,7 +23,7 @@ const filterDate = {
 const S3_BUCKET = process.env.S3_BUCKET;
 const S3_FOLDERS = process.env.S3_FOLDER.split(',');
 const DYNAMO_TABLE = process.env.DYNAMO_TABLE;
-const MULTIPART_THRESHOLD = parseInt(process.env.MULTIPART_THRESHOLD, 10);  // Multipart Upload limit in bytes
+const MULTIPART_THRESHOLD = parseInt(process.env.MULTIPART_THRESHOLD, 10);
 
 // Salesforce credentials
 const SF_USERNAME = process.env.SF_USERNAME;
@@ -48,23 +48,6 @@ const dynamoDB = new DynamoDBClient({ region: 'us-east-1' });
 const conn = new jsforce.Connection({
   loginUrl: process.env.SF_URL  // Salesforce sandbox URL
 });
-
-// Function to check if the file already exists in DynamoDB
-async function fileExistsInDynamoDB(fileName) {
-  const params = {
-    TableName: DYNAMO_TABLE,
-    Key: {
-      fileName: { S: fileName }
-    }
-  };
-  try {
-    const result = await dynamoDB.send(new GetItemCommand(params));
-    return !!result.Item;
-  } catch (err) {
-    console.error('Error checking DynamoDB for file:', err);
-    throw err;
-  }
-}
 
 function logErrorToFile(message) {
   const timestamp = new Date().toISOString(); // Timestamp para el log
@@ -225,9 +208,23 @@ async function processRecord(record, folder) {
   const fileId = record.ContentDocumentId;
   const parentId = record.LinkedEntityId;
   const pathOnClient = record.ContentDocument.LatestPublishedVersion.PathOnClient;
+
   const baseName = path.basename(pathOnClient).replace(/\s+/g, '_');
-  const folderName = `${folder}/${parentId}/${fileId}_${baseName}`;
-  const fileName = `${folderName}/${baseName}`;
+  const parentPrefix = `${folder}/${parentId}/`;
+  let s3Key = `${parentPrefix}${baseName}`;
+
+  try {
+    // If this succeeds the name is already taken → keep the id-scoped folder
+    await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }));
+    s3Key = `${parentPrefix}${fileId}_${baseName}/${baseName}`;
+    console.log(`Duplicate detected – will store in ${s3Key}`);
+  } catch (e) {
+    // 404/NotFound is expected when the object doesn’t exist – ignore
+    if (e.$metadata?.httpStatusCode !== 404 && e.name !== 'NotFound') throw e;
+  }
+
+  // what we log to Dynamo never changes
+  const dynamoFileName = `${parentPrefix}${fileId}_${baseName}/${baseName}`;
   const createdDate = record.ContentDocument.CreatedDate;
   const versionDataUrl = record.ContentDocument.LatestPublishedVersion.VersionData;
 
@@ -235,31 +232,31 @@ async function processRecord(record, folder) {
   // DynamoDB already checked up-front; no need to re-check here
 
   // Descarga el archivo
-  console.log(`Downloading file ID: ${fileId} - ${createdDate} - ${fileName}`);
+  console.log(`Downloading file ID: ${fileId} - ${createdDate} - ${s3Key}`);
   const buffer = await downloadFile(versionDataUrl);
 
   // Si la descarga falló (buffer es null), salta al siguiente registro y registra el error
   if (!buffer) {
-    logErrorToFile(`Failed to download file ${fileName} with URL: ${versionDataUrl}`);
-    console.log(`Skipping file ${fileName} due to download failure.`);
-    throw new Error(`Failed to download: ${fileName}`);
+    logErrorToFile(`Failed to download file ${s3Key} with URL: ${versionDataUrl}`);
+    console.log(`Skipping file ${s3Key} due to download failure.`);
+    throw new Error(`Failed to download: ${s3Key}`);
   }
 
   // Carga el archivo en S3
   try {
     if (buffer.length > MULTIPART_THRESHOLD) {
-      console.log(`File ${fileName} is larger than 5MB, using Multipart Upload...`);
-      await uploadLargeFileToS3(fileName, buffer);
+      console.log(`File ${s3Key} is larger than 5MB, using Multipart Upload...`);
+      await uploadLargeFileToS3(s3Key, buffer);
     } else {
-      console.log(`Uploading file ${fileName} to S3...`);
+      console.log(`Uploading file ${s3Key} to S3...`);
       const s3Params = {
         Bucket: S3_BUCKET,
-        Key: fileName, // Usa la ruta con Opportunity/id para simular la estructura de carpetas
+        Key: s3Key, // Usa la ruta con Opportunity/id para simular la estructura de carpetas
         Body: buffer,
         ContentType: 'application/octet-stream',
       };
       await s3.send(new PutObjectCommand(s3Params));
-      console.log(`File ${fileName} successfully uploaded to S3.`);
+      console.log(`File ${s3Key} successfully uploaded to S3.`);
     }
 
     // Registra el éxito en DynamoDB
@@ -267,13 +264,13 @@ async function processRecord(record, folder) {
       TableName: DYNAMO_TABLE,
       Item: {
         fileId: { S: fileId },
-        fileName: { S: fileName },
+        fileName: { S: dynamoFileName },
         migratedAt: { S: new Date().toISOString() },
         status: { S: 'SUCCESS' },
       },
     };
     await dynamoDB.send(new PutItemCommand(dynamoParams));
-    console.log(`Migration of file ${fileName} logged in DynamoDB.`);
+    console.log(`Migration of file ${dynamoFileName} logged in DynamoDB.`);
     answer = true;
 
     // Query ContentVersion and set S3_Migration__c = true
@@ -298,12 +295,12 @@ async function processRecord(record, folder) {
       }
     } catch (sfError) {
       //If updating S3_Migration__c fails, log to DynamoDB
-      console.error(`Error updating S3_Migration__c for file ${fileName} in Salesforce:`, sfError);
+      console.error(`Error updating S3_Migration__c for file ${dynamoFileName} in Salesforce:`, sfError);
 
       const dynamoErrorParams = {
         TableName: DYNAMO_TABLE,
         Item: {
-          fileName: { S: fileName },
+          fileName: { S: dynamoFileName },
           fileId: { S: fileId },
           migratedAt: { S: new Date().toISOString() },
           status: { S: 'SF_UPDATE_FAILED' },
@@ -311,17 +308,17 @@ async function processRecord(record, folder) {
         },
       };
       await dynamoDB.send(new PutItemCommand(dynamoErrorParams));
-      console.log(`Salesforce update failure for file ${fileName} logged in DynamoDB.`);
+      console.log(`Salesforce update failure for file ${dynamoFileName} logged in DynamoDB.`);
     }
   } catch (uploadError) {
     // Handle errors from the upload step
-    console.error(`Error uploading ${fileName} to S3:`, uploadError);
-    logErrorToFile(`Error uploading file ${fileName} to S3: ${uploadError.message}`);
+    console.error(`Error uploading ${s3Key} to S3:`, uploadError);
+    logErrorToFile(`Error uploading file ${s3Key} to S3: ${uploadError.message}`);
 
     const dynamoErrorParams = {
       TableName: DYNAMO_TABLE,
       Item: {
-        fileName: { S: fileName },
+        fileName: { S: dynamoFileName },
         fileId: { S: fileId },
         migratedAt: { S: new Date().toISOString() },
         status: { S: 'FAILED' },
@@ -329,7 +326,7 @@ async function processRecord(record, folder) {
       },
     };
     await dynamoDB.send(new PutItemCommand(dynamoErrorParams));
-    console.log(`Error for file ${fileName} logged in DynamoDB.`);
+    console.log(`Error for file ${dynamoFileName} logged in DynamoDB.`);
   } finally {
     return answer;
   }
@@ -339,7 +336,7 @@ async function processRecord(record, folder) {
 // fetch all Salesforce records in one paginated call
 async function fetchAllRecords(filters, folder) {
   const all = [];
-  let result = await conn.query(buildQuery(filters,folder));
+  let result = await conn.query(buildQuery(filters, folder));
   all.push(...result.records);
   while (!result.done) {
     result = await conn.queryMore(result.nextRecordsUrl);
