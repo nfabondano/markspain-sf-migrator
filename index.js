@@ -348,26 +348,26 @@ async function fetchAllRecords(filters, folder) {
 
 // list already-migrated keys from DynamoDB instead of S3
 async function listDynamoKeys(folder) {
-    const keys = new Set();
-    let ExclusiveStartKey;
-    const prefix = folder.replace(/\/$/, '') + '/';
-    do {
-      const resp = await dynamoDB.send(new ScanCommand({
-        TableName: DYNAMO_TABLE,
-        ProjectionExpression: 'fileName',
-        ExclusiveStartKey
-      }));
-     if (resp.Items) {
-        for (const i of resp.Items) {
-          const name = i.fileName?.S;
-          if (name?.startsWith(prefix)) keys.add(name);
-        }
+  const keys = new Set();
+  let ExclusiveStartKey;
+  const prefix = folder.replace(/\/$/, '') + '/';
+  do {
+    const resp = await dynamoDB.send(new ScanCommand({
+      TableName: DYNAMO_TABLE,
+      ProjectionExpression: 'fileName',
+      ExclusiveStartKey
+    }));
+    if (resp.Items) {
+      for (const i of resp.Items) {
+        const name = i.fileName?.S;
+        if (name?.startsWith(prefix)) keys.add(name);
       }
-      ExclusiveStartKey = resp.LastEvaluatedKey;
-    } while (ExclusiveStartKey);
-    console.log(`Found ${keys.size} existing DynamoDB records.`);
-    return keys;
-  }
+    }
+    ExclusiveStartKey = resp.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  console.log(`Found ${keys.size} existing DynamoDB records.`);
+  return keys;
+}
 
 // ────────────────────────────────────────────────────────────────────────────────
 // REPLACED main day‐by‐day driver with a single‐shot + pause + migrate‐missing
@@ -383,26 +383,41 @@ async function listDynamoKeys(folder) {
   // 1) fetch everything, 2) fetch S3, 3) diff, 4) pause, 5) process only missing
   try {
     for (const folder of S3_FOLDERS) {
-      const sfRecords = await fetchAllRecords(filterDate, folder);
+      // pre-load your already-migrated keys once per folder
       const migratedKeys = await listDynamoKeys(folder);
-      const missing = sfRecords.filter(rec => {
-        const parentId = rec.LinkedEntityId;
-        const pathOnClient = rec.ContentDocument.LatestPublishedVersion.PathOnClient;
-        const baseName = path.basename(pathOnClient).replace(/\s+/g, '_');
-        const key = `${folder}/${parentId}/${rec.ContentDocumentId}_${baseName}/${baseName}`;
-        return !migratedKeys.has(key);
-      });
 
-      console.log(`\n🚨  Found ${missing.length} missing items between ${filterDate.startDate} and ${filterDate.endDate}.\n`);
-      console.log('\nStarting migration of missing items…');
+      // compute first and last year
+      const startYear = new Date(filterDate.startDate).getFullYear();
+      const endYear = new Date(filterDate.endDate).getFullYear();
 
-      let migratedCount = 0;
-      for (const rec of missing) {
-        const ok = await processRecord(rec, folder);
-        if (ok) migratedCount++;
+      // loop one calendar-year at a time
+      for (let year = startYear; year <= endYear; year++) {
+        // build a per-year date range
+        const yearStart = `${year}-01-01T00:00:00Z`;
+        const yearEnd = `${year}-12-31T23:59:59Z`;
+        console.log(`\n➡️  Processing ${folder}, Year ${year} (${yearStart} → ${yearEnd})`);
+
+        // fetch only that year’s records
+        const sfRecords = await fetchAllRecords(
+          { startDate: yearStart, endDate: yearEnd },
+          folder
+        );
+
+        // find only the ones we haven’t migrated yet
+        const missing = sfRecords.filter(rec => {
+          const baseName = path.basename(rec.ContentDocument.LatestPublishedVersion.PathOnClient).replace(/\s+/g, '_');
+          const key = `${folder}/${rec.LinkedEntityId}/${rec.ContentDocumentId}_${baseName}/${baseName}`;
+          return !migratedKeys.has(key);
+        });
+        console.log(`→ Found ${missing.length} missing files in ${year}`);
+
+        // migrate that slice
+        let migratedCount = 0;
+        for (const rec of missing) {
+          if (await processRecord(rec, folder)) migratedCount++;
+        }
+        console.log(`✔ Migrated ${migratedCount}/${missing.length} for ${year}`);
       }
-      console.log(`📄 ${folder} → ${migratedCount} files migrated.`);
-
     }
     process.exit(0);
 
